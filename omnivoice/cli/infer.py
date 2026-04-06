@@ -28,6 +28,13 @@ import torchaudio
 from omnivoice.models.omnivoice import OmniVoice
 from omnivoice.utils.common import str2bool
 
+try:
+    import sounddevice as sd
+
+    _HAS_SOUNDDEVICE = True
+except ImportError:
+    _HAS_SOUNDDEVICE = False
+
 
 def get_best_device():
     """Auto-detect the best available device: CUDA > MPS > CPU."""
@@ -115,6 +122,15 @@ def get_parser() -> argparse.ArgumentParser:
         default=None,
         help="Device to use for inference. Auto-detected if not specified.",
     )
+    parser.add_argument(
+        "--stream",
+        type=str2bool,
+        default=False,
+        help="Stream audio chunks as they are generated. Requires sounddevice "
+        "(pip install sounddevice) for real-time playback. Each chunk is also "
+        "saved as <output>_chunk_NNNN.wav; the final concatenated file is saved "
+        "to <output> as usual.",
+    )
     return parser
 
 
@@ -130,9 +146,7 @@ def main():
         args.model, device_map=device, dtype=torch.float16
     )
 
-    logging.info(f"Generating audio for: {args.text[:80]}...")
-    audios = model.generate(
-        text=args.text,
+    gen_kwargs = dict(
         language=args.language,
         ref_audio=args.ref_audio,
         ref_text=args.ref_text,
@@ -149,8 +163,41 @@ def main():
         class_temperature=args.class_temperature,
     )
 
-    torchaudio.save(args.output, audios[0], model.sampling_rate)
-    logging.info(f"Saved to {args.output}")
+    if args.stream:
+        if _HAS_SOUNDDEVICE:
+            logging.info("Streaming mode enabled — audio will play as chunks arrive.")
+        else:
+            logging.warning(
+                "sounddevice not found (pip install sounddevice). "
+                "Chunks will be saved to disk but not played back in real time."
+            )
+
+        logging.info(f"Streaming audio for: {args.text[:80]}...")
+        collected = []
+        for chunk_idx, total_chunks, chunk_audio in model.generate_stream(
+            text=args.text, **gen_kwargs
+        ):
+            chunk_path = f"{args.output}_chunk_{chunk_idx:04d}.wav"
+            torchaudio.save(chunk_path, chunk_audio, model.sampling_rate)
+            logging.info(
+                f"  Chunk {chunk_idx + 1}"
+                + (f"/{total_chunks}" if total_chunks >= 0 else "")
+                + f" saved to {chunk_path}"
+            )
+            if _HAS_SOUNDDEVICE:
+                audio_np = chunk_audio.squeeze(0).numpy()
+                sd.play(audio_np, samplerate=model.sampling_rate)
+                sd.wait()
+            collected.append(chunk_audio)
+
+        final_audio = torch.cat(collected, dim=-1)
+        torchaudio.save(args.output, final_audio, model.sampling_rate)
+        logging.info(f"Final audio saved to {args.output}")
+    else:
+        logging.info(f"Generating audio for: {args.text[:80]}...")
+        audios = model.generate(text=args.text, **gen_kwargs)
+        torchaudio.save(args.output, audios[0], model.sampling_rate)
+        logging.info(f"Saved to {args.output}")
 
 
 if __name__ == "__main__":

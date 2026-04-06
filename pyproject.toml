@@ -44,6 +44,10 @@ dependencies = [
 
 [project.optional-dependencies]
 
+stream = [
+    "sounddevice",        # Real-time audio playback during streaming generation
+]
+
 eval = [
     "jiwer==3.1.0",       # WER
     "librosa",             # Audio processing

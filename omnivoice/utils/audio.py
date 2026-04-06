@@ -176,7 +176,7 @@ def tensor_to_audiosegment(tensor, sample_rate):
     """
     # Convert tensor to numpy array
     assert isinstance(tensor, torch.Tensor)
-    audio_np = tensor.cpu().numpy()
+    audio_np = tensor.detach().cpu().numpy()
 
     # Convert to int16 type (common format for pydub)
     # Assumes tensor values are in [-1, 1] range as floating point

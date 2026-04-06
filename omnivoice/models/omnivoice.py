@@ -31,10 +31,12 @@ import difflib
 import logging
 import math
 import os
+import queue
 import re
+import threading
 from dataclasses import dataclass, fields
 from functools import partial
-from typing import Any, List, Optional, Union
+from typing import Any, Generator, Iterator, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -610,6 +612,306 @@ class OmniVoice(PreTrainedModel):
             )
 
         return generated_audios
+
+    def generate_stream(
+        self,
+        text: str,
+        language: Union[str, None] = None,
+        ref_text: Union[str, None] = None,
+        ref_audio: Union[
+            str, tuple[torch.Tensor, int], None
+        ] = None,
+        voice_clone_prompt: Union[VoiceClonePrompt, None] = None,
+        instruct: Union[str, None] = None,
+        duration: Union[float, None] = None,
+        speed: Union[float, None] = None,
+        generation_config: Optional[OmniVoiceGenerationConfig] = None,
+        **kwargs,
+    ) -> Generator[Tuple[int, int, torch.Tensor], None, None]:
+        """Stream audio chunks as they are generated (single-item only).
+
+        Yields decoded audio tensors one chunk at a time so playback can begin
+        before the full utterance is ready.  For short texts the model still
+        generates in one shot, so a single ``(0, 1, audio)`` tuple is yielded
+        after generation completes.  For long texts the model splits the input
+        into segments and each decoded segment is yielded as soon as it is ready.
+
+        Args:
+            text: Target text to synthesise.
+            All other args are identical to :meth:`generate`.
+
+        Yields:
+            ``(chunk_idx, total_chunks, audio_tensor)`` where *audio_tensor*
+            has shape ``(1, T)`` and the sampling rate equals
+            ``model.sampling_rate``.  ``total_chunks`` is ``-1`` until the
+            chunking plan is known (non-chunked path always emits ``total=1``).
+        """
+        if self.audio_tokenizer is None or self.text_tokenizer is None:
+            raise RuntimeError(
+                "Model is not loaded with audio/text tokenizers. Make sure you "
+                "loaded the model with OmniVoice.from_pretrained()."
+            )
+        gen_config = (
+            generation_config
+            if generation_config is not None
+            else OmniVoiceGenerationConfig.from_dict(kwargs)
+        )
+
+        self.eval()
+
+        full_task = self._preprocess_all(
+            text=text,
+            language=language,
+            ref_text=ref_text,
+            ref_audio=ref_audio,
+            voice_clone_prompt=voice_clone_prompt,
+            instruct=instruct,
+            preprocess_prompt=gen_config.preprocess_prompt,
+            speed=speed,
+            duration=duration,
+        )
+
+        short_idx, long_idx = full_task.get_indices(
+            gen_config, self.audio_tokenizer.config.frame_rate
+        )
+
+        # ---- non-chunked path (short text) --------------------------------
+        if short_idx:
+            short_task = full_task.slice_task(short_idx)
+            tokens = self._generate_iterative(short_task, gen_config)[0]
+            audio = self._decode_and_post_process(
+                tokens, full_task.ref_rms[0], gen_config
+            )
+            yield (0, 1, audio)
+            return
+
+        # ---- chunked path (long text) -------------------------------------
+        task = full_task.slice_task(long_idx)
+
+        # Replicate chunking logic from _generate_chunked but yield inline.
+        avg_tokens_per_char = task.target_lens[0] / len(task.texts[0])
+        text_chunk_len = int(
+            gen_config.audio_chunk_duration
+            * self.audio_tokenizer.config.frame_rate
+            / avg_tokens_per_char
+        )
+        chunks = chunk_text_punctuation(
+            text=task.texts[0],
+            chunk_len=text_chunk_len,
+            min_chunk_len=3,
+        )
+        total_chunks = len(chunks)
+        logger.debug("Streaming %d chunk(s) for text: %s", total_chunks, task.texts[0][:60])
+
+        has_ref = task.ref_audio_tokens[0] is not None
+
+        def _decode_chunk(token_tensor: torch.Tensor) -> torch.Tensor:
+            tokenizer_device = self.audio_tokenizer.device
+            audio_waveform = (
+                self.audio_tokenizer.decode(
+                    token_tensor.to(tokenizer_device).unsqueeze(0)
+                )
+                .audio_values[0]
+                .cpu()
+            )
+            return self._post_process_audio(
+                audio_waveform,
+                postprocess_output=gen_config.postprocess_output,
+                ref_rms=task.ref_rms[0],
+            )
+
+        def _run_single(text_chunk, ref_audio_tok, ref_text_val):
+            target_len = self._estimate_target_tokens(
+                text_chunk,
+                ref_text_val,
+                ref_audio_tok.size(-1) if ref_audio_tok is not None else None,
+                speed=task.speed[0] if task.speed else 1.0,
+            )
+            sub_task = GenerationTask(
+                batch_size=1,
+                texts=[text_chunk],
+                target_lens=[target_len],
+                langs=[task.langs[0]],
+                instructs=[task.instructs[0]],
+                ref_texts=[ref_text_val],
+                ref_audio_tokens=[ref_audio_tok],
+                ref_rms=[task.ref_rms[0]],
+                speed=[task.speed[0]] if task.speed else None,
+            )
+            return self._generate_iterative(sub_task, gen_config)[0]
+
+        if has_ref:
+            for ci, chunk_text in enumerate(chunks):
+                tokens = _run_single(
+                    chunk_text, task.ref_audio_tokens[0], task.ref_texts[0]
+                )
+                yield (ci, total_chunks, _decode_chunk(tokens))
+        else:
+            # Generate chunk 0 (free-running), then use it as reference.
+            first_tokens = _run_single(chunks[0], None, None)
+            yield (0, total_chunks, _decode_chunk(first_tokens))
+            for ci, chunk_text in enumerate(chunks[1:], start=1):
+                tokens = _run_single(chunk_text, first_tokens, chunks[0])
+                yield (ci, total_chunks, _decode_chunk(tokens))
+
+    def generate_from_text_stream(
+        self,
+        text_iter: Iterator[str],
+        language: Union[str, None] = None,
+        ref_text: Union[str, None] = None,
+        ref_audio: Union[str, tuple[torch.Tensor, int], None] = None,
+        voice_clone_prompt: Union[VoiceClonePrompt, None] = None,
+        instruct: Union[str, None] = None,
+        speed: Union[float, None] = None,
+        generation_config: Optional[OmniVoiceGenerationConfig] = None,
+        min_chunk_chars: int = 20,
+        max_chunk_chars: int = 200,
+        **kwargs,
+    ) -> Generator[Tuple[int, torch.Tensor], None, None]:
+        """Stream audio from a live LLM token iterator.
+
+        Designed for voice-agent pipelines where text arrives token-by-token
+        from an LLM.  Sentences are buffered until a natural boundary is hit
+        (or ``max_chunk_chars`` is reached), then TTS generation fires
+        immediately.  Generation and vocoder decode are overlapped via a
+        background thread so the next sentence starts decoding while the
+        current one is being played.
+
+        Args:
+            text_iter: Iterator/generator of text tokens from the LLM.
+            min_chunk_chars: Don't flush until at least this many characters
+                are buffered (avoids tiny chunks for leading punctuation).
+            max_chunk_chars: Force-flush once the buffer reaches this length
+                even without a sentence boundary (~3–4 s of audio).
+            All other args are identical to :meth:`generate`.
+
+        Yields:
+            ``(sentence_idx, audio_tensor)`` where *audio_tensor* has shape
+            ``(1, T)`` at ``model.sampling_rate``.  Chunks arrive in order as
+            soon as each one is ready.
+        """
+        if self.audio_tokenizer is None or self.text_tokenizer is None:
+            raise RuntimeError(
+                "Model is not loaded with audio/text tokenizers. Make sure you "
+                "loaded the model with OmniVoice.from_pretrained()."
+            )
+        gen_config = (
+            generation_config
+            if generation_config is not None
+            else OmniVoiceGenerationConfig.from_dict(kwargs)
+        )
+        self.eval()
+
+        # Pre-encode reference audio once so it's not repeated per chunk.
+        if voice_clone_prompt is None and ref_audio is not None:
+            voice_clone_prompt = self.create_voice_clone_prompt(
+                ref_audio,
+                ref_text=ref_text,
+                preprocess_prompt=gen_config.preprocess_prompt,
+            )
+
+        # ------------------------------------------------------------------ #
+        # Sentence buffering: split LLM token stream into TTS-ready chunks.  #
+        # ------------------------------------------------------------------ #
+        _SENT_END = re.compile(r"[.!?…]+(?:\s|$)")
+        _CLAUSE_END = re.compile(r"[,;:]\s")
+
+        def _iter_sentences(token_iter: Iterator[str]) -> Iterator[str]:
+            buf = ""
+            for token in token_iter:
+                buf += token
+                # Hard flush at max length
+                if len(buf) >= max_chunk_chars:
+                    yield buf.strip()
+                    buf = ""
+                    continue
+                # Soft flush at sentence boundary
+                if len(buf) >= min_chunk_chars and _SENT_END.search(buf):
+                    yield buf.strip()
+                    buf = ""
+                    continue
+                # Clause boundary flush when buffer is getting long
+                if len(buf) >= max_chunk_chars // 2 and _CLAUSE_END.search(buf):
+                    yield buf.strip()
+                    buf = ""
+            if buf.strip():
+                yield buf.strip()
+
+        # ------------------------------------------------------------------ #
+        # Pipeline: generate in background thread, decode on main thread.    #
+        # Each entry in the queue is (sentence_idx, tokens | None=sentinel). #
+        # ------------------------------------------------------------------ #
+        token_queue: queue.Queue = queue.Queue(maxsize=2)
+        _DONE = object()
+
+        def _generation_worker(sentences):
+            first_tokens = None
+            first_text = None
+            for idx, sentence in enumerate(sentences):
+                logger.debug("Generating sentence %d: %s", idx, sentence[:60])
+                ref_vc = voice_clone_prompt
+                ref_t = None
+                if ref_vc is None and first_tokens is not None:
+                    # Auto-voice: use first chunk as reference for consistency.
+                    ref_t = first_text
+                    # Build a lightweight VoiceClonePrompt from first chunk tokens.
+                    ref_vc = VoiceClonePrompt(
+                        ref_audio_tokens=first_tokens,
+                        ref_text=first_text,
+                        ref_rms=None,
+                    )
+
+                full_task = self._preprocess_all(
+                    text=sentence,
+                    language=language,
+                    ref_text=ref_vc.ref_text if ref_vc else None,
+                    ref_audio=None,
+                    voice_clone_prompt=ref_vc,
+                    instruct=instruct,
+                    preprocess_prompt=gen_config.preprocess_prompt,
+                    speed=speed,
+                    duration=None,
+                )
+                short_idx, long_idx = full_task.get_indices(
+                    gen_config, self.audio_tokenizer.config.frame_rate
+                )
+                task_idx = short_idx if short_idx else long_idx
+                task = full_task.slice_task(task_idx)
+                tokens = self._generate_iterative(task, gen_config)[0]
+
+                if idx == 0 and voice_clone_prompt is None:
+                    first_tokens = tokens
+                    first_text = sentence
+
+                token_queue.put((idx, tokens, full_task.ref_rms[task_idx[0]]))
+
+            token_queue.put(_DONE)
+
+        sentences_iter = _iter_sentences(text_iter)
+        worker = threading.Thread(
+            target=_generation_worker, args=(sentences_iter,), daemon=True
+        )
+        worker.start()
+
+        tokenizer_device = self.audio_tokenizer.device
+        while True:
+            item = token_queue.get()
+            if item is _DONE:
+                break
+            idx, tokens, ref_rms = item
+            audio_waveform = (
+                self.audio_tokenizer.decode(tokens.to(tokenizer_device).unsqueeze(0))
+                .audio_values[0]
+                .cpu()
+            )
+            audio = self._post_process_audio(
+                audio_waveform,
+                postprocess_output=gen_config.postprocess_output,
+                ref_rms=ref_rms,
+            )
+            yield (idx, audio)
+
+        worker.join()
 
     def create_voice_clone_prompt(
         self,
